@@ -1,14 +1,18 @@
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432
+    url: jdbc:postgresql://localhost:5432/postgres
     username: postgres
     password: postgres
     driver-class-name: org.postgresql.Driver
   jpa:
-    database: postgres
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        format_sql: true
 
 app:
   security:
     jwt-secret: super-secret
-    jwt-expiration-ms: 60000
-    jwt-refresh-expiration-ms: 4800000
+    jwt-expiration-ms: 600000
+    jwt-refresh-expiration-ms: 96000000
