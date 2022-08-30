@@ -1,132 +1,107 @@
 package ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.controller;
 
+import org.apache.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.security.authentication.AuthenticationManager;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.models.AppUser;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.models.ERole;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.models.RefreshToken;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.request.LogOutRequest;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.request.LoginRequest;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.request.SignupRequest;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.request.TokenRefreshRequest;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.response.JwtResponse;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.response.MessageResponse;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.payload.response.TokenRefreshResponse;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.repository.AppRoleRepository;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.repository.AppUserRepository;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.security.jwt.JwtUtils;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.security.service.RefreshTokenService;
-import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.security.service.UserDetailsImpl;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.exception.TokenRefreshException;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.exception.UserLoginException;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.exception.UserRegistrationException;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.model.CustomUserDetails;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.model.payload.*;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.model.token.RefreshToken;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.security.JwtTokenProvider;
+import ru.notebookforeignlanguages.notebookforeignlanguagesback.authentication.service.AuthService;
 
 import javax.validation.Valid;
-import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
 
-@CrossOrigin(origins = "*", maxAge = 3600)
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
-    private final AuthenticationManager authenticationManager;
-    private final AppUserRepository userRepository;
-    private final AppRoleRepository roleRepository;
-    private final PasswordEncoder encoder;
-    private final JwtUtils jwtUtils;
-    private final RefreshTokenService refreshTokenService;
 
+    private static final Logger logger = Logger.getLogger(AuthController.class);
+    private final AuthService authService;
+    private final JwtTokenProvider tokenProvider;
+
+    @Autowired
     public AuthController(
-            AuthenticationManager authenticationManager,
-            AppUserRepository userRepository,
-            AppRoleRepository roleRepository,
-            PasswordEncoder encoder,
-            JwtUtils jwtUtils,
-            RefreshTokenService refreshTokenService
+            AuthService authService,
+            JwtTokenProvider tokenProvider
     ) {
-        this.authenticationManager = authenticationManager;
-        this.userRepository = userRepository;
-        this.roleRepository = roleRepository;
-        this.encoder = encoder;
-        this.jwtUtils = jwtUtils;
-        this.refreshTokenService = refreshTokenService;
+        this.authService = authService;
+        this.tokenProvider = tokenProvider;
     }
 
-    @PostMapping("/signin")
-    public ResponseEntity<?> authenticateUser(@Valid @RequestBody LoginRequest loginRequest) {
+    @GetMapping("/checkEmailInUse")
+    public ResponseEntity<ApiResponse> checkEmailInUse(@RequestParam("email") String email) {
+        Boolean emailExists = authService.emailAlreadyExists(email);
+        return ResponseEntity.ok(new ApiResponse(true, emailExists.toString()));
+    }
 
-        Authentication authentication = authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(
-                loginRequest.getUsername(),
-                loginRequest.getPassword()
-        ));
+    @GetMapping("/checkUsernameInUse")
+    public ResponseEntity<ApiResponse> checkUsernameInUse(@RequestParam("username") String username) {
+        Boolean usernameExists = authService.usernameAlreadyExists(username);
+        return ResponseEntity.ok(new ApiResponse(true, usernameExists.toString()));
+    }
 
+    @PostMapping("/login")
+    public ResponseEntity<JwtAuthenticationResponse> authenticateUser(@Valid @RequestBody LoginRequest loginRequest) {
+
+        Authentication authentication = authService.authenticateUser(loginRequest)
+                                                   .orElseThrow(() -> new UserLoginException("Couldn't login user [" + loginRequest + "]"));
+
+        CustomUserDetails customUserDetails = (CustomUserDetails) authentication.getPrincipal();
+        logger.info("Logged in User returned [API]: " + customUserDetails.getUsername());
         SecurityContextHolder.getContext().setAuthentication(authentication);
 
-        UserDetailsImpl userDetails = (UserDetailsImpl) authentication.getPrincipal();
-
-        String jwt = jwtUtils.generateJwtToken(userDetails);
-
-        List<String> roles = userDetails.getAuthorities().stream().map(GrantedAuthority::getAuthority).collect(
-                Collectors.toList());
-
-        RefreshToken refreshToken = refreshTokenService.createRefreshToken(userDetails.getId());
-
-        return ResponseEntity.ok(new JwtResponse(
-                jwt,
-                refreshToken.getToken(),
-                userDetails.getId(),
-                userDetails.getUsername(),
-                userDetails.getEmail(),
-                roles
-        ));
+        return authService.createAndPersistRefreshTokenForDevice(authentication, loginRequest)
+                          .map(RefreshToken::getToken)
+                          .map(refreshToken -> {
+                              String jwtToken = authService.generateToken(customUserDetails);
+                              return ResponseEntity.ok(new JwtAuthenticationResponse(
+                                      jwtToken,
+                                      refreshToken,
+                                      tokenProvider.getExpiryDuration()
+                              ));
+                          })
+                          .orElseThrow(() -> new UserLoginException("Couldn't create refresh token for: [" + loginRequest + "]"));
     }
 
-    @PostMapping("/signup")
-    public ResponseEntity<?> registerUser(@RequestBody SignupRequest signUpRequest) {
-        if (userRepository.existsByUsername(signUpRequest.getUsername())) {
-            return ResponseEntity.badRequest().body(new MessageResponse("Error: Username is already taken!"));
-        }
+    @PostMapping("/register")
+    public ResponseEntity<ApiResponse> registerUser(@Valid @RequestBody RegistrationRequest registrationRequest) {
 
-        if (userRepository.existsByEmail(signUpRequest.getEmail())) {
-            return ResponseEntity.badRequest().body(new MessageResponse("Error: Email is already in use!"));
-        }
-
-        // Create new user's account
-        AppUser user = new AppUser();
-        user.setUsername(signUpRequest.getUsername());
-        user.setEmail(signUpRequest.getEmail());
-        user.setPassword(encoder.encode(signUpRequest.getPassword()));
-        user.setRoles(
-                Set.of(roleRepository
-                               .findByName(ERole.ROLE_USER)
-                               .orElseThrow(() -> new RuntimeException("Error: Role is not found."))
-                )
-        );
-
-        userRepository.save(user);
-
-        return ResponseEntity.ok(new MessageResponse("User registered successfully!"));
+        return authService.registerUser(registrationRequest)
+                          .map(user -> {
+                              logger.info("Registered User returned [API[: " + user);
+                              return ResponseEntity.ok(new ApiResponse(
+                                      true,
+                                      "User registered successfully. Check your email for verification"
+                              ));
+                          })
+                          .orElseThrow(() -> new UserRegistrationException(
+                                  registrationRequest.getEmail(),
+                                  "Missing user object in database"
+                          ));
     }
 
-    @PostMapping("/refreshtoken")
-    public ResponseEntity<?> refreshtoken(@Valid @RequestBody TokenRefreshRequest request) {
-        String requestRefreshToken = request.getRefreshToken();
+    @PostMapping("/refresh")
+    public ResponseEntity<JwtAuthenticationResponse> refreshJwtToken(@Valid @RequestBody TokenRefreshRequest tokenRefreshRequest) {
 
-        return refreshTokenService.findByToken(requestRefreshToken).map(refreshTokenService::verifyExpiration).map(
-                RefreshToken::getUser).map(user -> {
-            String token = jwtUtils.generateTokenFromUsername(user.getUsername());
-            return ResponseEntity.ok(new TokenRefreshResponse(token, requestRefreshToken));
-        }).orElseThrow(() -> new AccessDeniedException("Refresh token is not in database!"));
-    }
-
-    @PostMapping("/logout")
-    public ResponseEntity<?> logoutUser(@Valid @RequestBody LogOutRequest logOutRequest) {
-        refreshTokenService.deleteByUserId(logOutRequest.getUserId());
-        return ResponseEntity.ok(new MessageResponse("Log out successful!"));
+        return authService.refreshJwtToken(tokenRefreshRequest)
+                          .map(updatedToken -> {
+                              String refreshToken = tokenRefreshRequest.getRefreshToken();
+                              logger.info("Created new Jwt Auth token: " + updatedToken);
+                              return ResponseEntity.ok(new JwtAuthenticationResponse(
+                                      updatedToken,
+                                      refreshToken,
+                                      tokenProvider.getExpiryDuration()
+                              ));
+                          })
+                          .orElseThrow(() -> new TokenRefreshException(
+                                  tokenRefreshRequest.getRefreshToken(),
+                                  "Unexpected error during token refresh. Please logout and login again."
+                          ));
     }
 }
